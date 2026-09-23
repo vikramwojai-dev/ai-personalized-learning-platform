@@ -1,0 +1,493 @@
+// ==============================================================================
+// SYNAPSE AI - PRODUCTION PRISMA SCHEMA
+// Architecture: Next.js + PostgreSQL + pgvector (Vector DB) + NextAuth/Clerk
+// ==============================================================================
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = []
+}
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+// ------------------------------------------------------------------------------
+// 1. AUTHENTICATION & USER MANAGEMENT
+// ------------------------------------------------------------------------------
+
+enum Role {
+  STUDENT
+  INSTRUCTOR
+  ADMIN
+}
+
+enum LearningStyle {
+  VISUAL          // Learns best via diagrams, flowcharts, mental models
+  CONCEPTUAL      // Learns best via first-principles theory, rigorous proofs
+  PRACTICE_HEAVY  // Learns best via hands-on coding, immediate application
+  SOCRATIC        // Learns best via guided inquiry & interactive dialogue
+}
+
+enum SubscriptionTier {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  role          Role      @default(STUDENT)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // 1-to-1 Profile & Adaptive Learning State
+  learningProfile     LearningProfile?
+  
+  // Relations
+  enrollments         CourseEnrollment[]
+  nodeProgress        StudentNodeProgress[]
+  quizAttempts        QuizAttempt[]
+  assessmentLogs      AssessmentLog[]
+  tutorSessions       TutorSession[]
+  spacedRepetition    SpacedRepetitionCard[]
+  subscription        Subscription?
+  masteryHistory      MasteryHistory[]
+
+  @@index([email])
+}
+
+model LearningProfile {
+  id                    String        @id @default(cuid())
+  userId                String        @unique
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Adaptive Learning Preferences
+  preferredStyle        LearningStyle @default(VISUAL)
+  targetPaceHoursPerWk  Float         @default(5.0)
+  currentStreakDays     Int           @default(0)
+  lastActiveAt          DateTime      @default(now())
+  
+  // Global Latent Ability (Item Response Theory θ theta, centered at 0.0, range [-3, +3])
+  globalAbilityTheta    Float         @default(0.0)
+  totalXp               Int           @default(0)
+  level                 Int           @default(1)
+  
+  // Diagnostic State
+  diagnosticCompleted   Boolean       @default(false)
+  diagnosticScore       Float?
+  
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+}
+
+// ------------------------------------------------------------------------------
+// 2. CURRICULUM & DYNAMIC KNOWLEDGE GRAPH (DAG)
+// ------------------------------------------------------------------------------
+
+enum NodeMasteryState {
+  LOCKED          // Prerequisites not met
+  AVAILABLE       // Ready to start
+  IN_PROGRESS     // Under active study
+  MASTERED        // P(Mastery) >= 0.85
+  NEEDS_REVIEW    // Forgetting curve decay threshold reached
+}
+
+enum BloomTaxonomyLevel {
+  REMEMBER
+  UNDERSTAND
+  APPLY
+  ANALYZE
+  EVALUATE
+  CREATE
+}
+
+model Course {
+  id          String             @id @default(cuid())
+  slug        String             @unique
+  title       String
+  description String             @db.Text
+  icon        String?
+  bannerImage String?
+  isPublished Boolean            @default(true)
+  orderIndex  Int                @default(0)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  topics      Topic[]
+  enrollments CourseEnrollment[]
+
+  @@index([slug])
+}
+
+model Topic {
+  id          String          @id @default(cuid())
+  courseId    String
+  course      Course          @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title       String
+  slug        String
+  description String          @db.Text
+  orderIndex  Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  knowledgeNodes KnowledgeNode[]
+
+  @@unique([courseId, slug])
+  @@index([courseId])
+}
+
+model KnowledgeNode {
+  id                  String             @id @default(cuid())
+  topicId             String
+  topic               Topic              @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  title               String
+  slug                String
+  description         String             @db.Text
+  bloomLevel          BloomTaxonomyLevel @default(UNDERSTAND)
+  estimatedMinutes    Int                @default(20)
+  
+  // Dynamic Graph Positioning (for UI DAG visualizer)
+  graphX              Float              @default(0)
+  graphY              Float              @default(0)
+  
+  // Multi-modal lesson content
+  visualContent       String             @db.Text // Mermaid diagrams, SVG layouts, flowcharts
+  conceptualContent   String             @db.Text // Deep theory, math formulas, rigorous intuition
+  practiceContent     String             @db.Text // Hands-on coding exercises, test cases
+  
+  // Bayesian Knowledge Tracing (BKT) Node Priors
+  bktPriorL0          Float              @default(0.10) // P(L_0): Prior probability of initial mastery
+  bktTransitionT      Float              @default(0.15) // P(T): Probability of learning transition
+  bktSlipS            Float              @default(0.10) // P(S): Probability of slip (knows it but makes mistake)
+  bktGuessG           Float              @default(0.20) // P(G): Probability of guess (doesn't know but guesses correctly)
+
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  // DAG Relationships (Prerequisites and Dependents)
+  prerequisites       KnowledgePrerequisite[] @relation("Prerequisites")
+  dependents          KnowledgePrerequisite[] @relation("Dependents")
+
+  // Content Vector Embeddings for RAG (pgvector)
+  contentEmbeddings   ContentEmbedding[]
+  
+  // Student Relations
+  studentProgress     StudentNodeProgress[]
+  questions           Question[]
+  spacedRepetition    SpacedRepetitionCard[]
+  masteryHistory      MasteryHistory[]
+
+  @@unique([topicId, slug])
+  @@index([topicId])
+}
+
+model KnowledgePrerequisite {
+  id              String        @id @default(cuid())
+  nodeId          String        // Dependent Node
+  prerequisiteId  String        // Prerequisite Node
+  node            KnowledgeNode @relation("Prerequisites", fields: [nodeId], references: [id], onDelete: Cascade)
+  prerequisite    KnowledgeNode @relation("Dependents", fields: [prerequisiteId], references: [id], onDelete: Cascade)
+  strength        Float         @default(1.0) // 0.0 - 1.0 necessity weighting
+
+  @@unique([nodeId, prerequisiteId])
+  @@index([nodeId])
+  @@index([prerequisiteId])
+}
+
+// ------------------------------------------------------------------------------
+// 3. VECTOR DB & RAG EMBEDDINGS (pgvector Integration)
+// ------------------------------------------------------------------------------
+
+model ContentEmbedding {
+  id              String        @id @default(cuid())
+  nodeId          String
+  node            KnowledgeNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  chunkIndex      Int           @default(0)
+  contentChunk    String        @db.Text
+  tokenCount      Int           @default(0)
+  
+  // Metadata for hybrid semantic search
+  chunkType       String        @default("theory") // theory | example | code | misconception
+  
+  createdAt       DateTime      @default(now())
+
+  @@index([nodeId])
+}
+
+// ------------------------------------------------------------------------------
+// 4. STUDENT PROGRESS & BAYESIAN KNOWLEDGE TRACING (BKT)
+// ------------------------------------------------------------------------------
+
+model CourseEnrollment {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseId    String
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  enrolledAt  DateTime  @default(now())
+  completedAt DateTime?
+  
+  @@unique([userId, courseId])
+  @@index([userId])
+  @@index([courseId])
+}
+
+model StudentNodeProgress {
+  id                  String           @id @default(cuid())
+  userId              String
+  user                User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeId              String
+  node                KnowledgeNode    @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  
+  // Dynamic Mastery Metrics
+  masteryState        NodeMasteryState @default(AVAILABLE)
+  masteryProbability  Float            @default(0.10) // P(L): Current Bayesian Knowledge Tracing posterior
+  
+  // Ebbinghaus Forgetting Curve & Spaced Repetition Parameters
+  memoryStabilityS    Float            @default(1.0) // Stability in days
+  retrievabilityR     Float            @default(1.0) // Current predicted recall probability: R = exp(-t/S)
+  lastReviewedAt      DateTime         @default(now())
+  nextReviewDueDate   DateTime         @default(now())
+  
+  // Performance Statistics
+  attemptsCount       Int              @default(0)
+  correctCount        Int              @default(0)
+  consecutiveCorrect  Int              @default(0)
+  timeSpentSeconds    Int              @default(0)
+  
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@unique([userId, nodeId])
+  @@index([userId, masteryState])
+  @@index([nextReviewDueDate])
+}
+
+model MasteryHistory {
+  id                  String        @id @default(cuid())
+  userId              String
+  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeId              String
+  node                KnowledgeNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  masteryProbability  Float
+  eventTrigger        String        // QUIZ_ANSWER | DIAGNOSTIC | TUTOR_CHECK | TIME_DECAY
+  createdAt           DateTime      @default(now())
+
+  @@index([userId, nodeId])
+  @@index([createdAt])
+}
+
+// ------------------------------------------------------------------------------
+// 5. ADAPTIVE QUIZ & ITEM RESPONSE THEORY (IRT) ENGINE
+// ------------------------------------------------------------------------------
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  MULTIPLE_SELECT
+  CODE_COMPLETION
+  ORDERING
+  CONCEPT_EXPLANATION
+}
+
+enum QuestionDifficulty {
+  NOVICE        // IRT b parameter approx -1.5
+  INTERMEDIATE  // IRT b parameter approx 0.0
+  ADVANCED      // IRT b parameter approx +1.5
+  EXPERT        // IRT b parameter approx +2.5
+}
+
+model Quiz {
+  id          String        @id @default(cuid())
+  title       String
+  description String?       @db.Text
+  isAdaptive  Boolean       @default(true)
+  targetNodes String[]      // Array of KnowledgeNode IDs covered
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  attempts    QuizAttempt[]
+}
+
+model Question {
+  id                  String              @id @default(cuid())
+  nodeId              String
+  node                KnowledgeNode       @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  type                QuestionType        @default(MULTIPLE_CHOICE)
+  difficulty          QuestionDifficulty  @default(INTERMEDIATE)
+  
+  // Item Response Theory (IRT 3PL Parameters)
+  irtDifficultyB      Float               @default(0.0) // Item Difficulty (-3.0 to +3.0)
+  irtDiscriminationA  Float               @default(1.0) // Discrimination slope parameter
+  irtGuessingC        Float               @default(0.25)// Pseudo-guessing parameter (0.25 for 4 choices)
+  
+  prompt              String              @db.Text
+  codeSnippet         String?             @db.Text
+  options             Json                // Array of { id, text, isCorrect, explanation, visualHint }
+  correctOptionId     String
+  detailedExplanation String              @db.Text
+  
+  // Socratic Hint Ladder
+  hintLevel1          String              @db.Text // Guiding Question
+  hintLevel2          String              @db.Text // Conceptual Clue
+  hintLevel3          String              @db.Text // Worked Example Analogy
+  
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  attempts            QuestionAttempt[]
+
+  @@index([nodeId])
+  @@index([irtDifficultyB])
+}
+
+model QuizAttempt {
+  id              String            @id @default(cuid())
+  quizId          String?
+  quiz            Quiz?             @relation(fields: [quizId], references: [id], onDelete: SetNull)
+  userId          String
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isDiagnostic    Boolean           @default(false)
+  score           Float             @default(0)
+  totalQuestions  Int               @default(0)
+  correctAnswers  Int               @default(0)
+  timeTakenSec    Int               @default(0)
+  initialTheta    Float             @default(0.0) // Student IRT ability at start
+  finalTheta      Float             @default(0.0) // Student IRT ability at end
+  completedAt     DateTime          @default(now())
+
+  questionAttempts QuestionAttempt[]
+
+  @@index([userId])
+}
+
+model QuestionAttempt {
+  id                  String        @id @default(cuid())
+  quizAttemptId       String
+  quizAttempt         QuizAttempt   @relation(fields: [quizAttemptId], references: [id], onDelete: Cascade)
+  questionId          String
+  question            Question      @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selectedOptionId    String
+  isCorrect           Boolean
+  timeSpentSec        Int           @default(0)
+  hintsUsedCount      Int           @default(0)
+  deltaMasteryProb    Float         @default(0.0) // Change in BKT P(L)
+  studentThetaBefore  Float         @default(0.0)
+  studentThetaAfter   Float         @default(0.0)
+  createdAt           DateTime      @default(now())
+
+  @@index([quizAttemptId])
+  @@index([questionId])
+}
+
+// ------------------------------------------------------------------------------
+// 6. ASSESSMENT AUDIT & LEARNING TELEMETRY LOGS
+// ------------------------------------------------------------------------------
+
+model AssessmentLog {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeId          String
+  eventType       String    // QUIZ_SUBMIT | HINT_REQUESTED | DIAGNOSTIC_START | FORGETTING_ALERT
+  rawPayload      Json      // Telemetry metrics, cognitive load indicators, response latencies
+  createdAt       DateTime  @default(now())
+
+  @@index([userId, nodeId])
+  @@index([createdAt])
+}
+
+// ------------------------------------------------------------------------------
+// 7. AI SOCRATIC TUTOR & RAG SESSIONS
+// ------------------------------------------------------------------------------
+
+model TutorSession {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeId        String?
+  sessionTitle  String         @default("Socratic Tutoring Session")
+  learningStyle LearningStyle  @default(VISUAL)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  messages      TutorMessage[]
+
+  @@index([userId])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+model TutorMessage {
+  id              String       @id @default(cuid())
+  sessionId       String
+  session         TutorSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role            MessageRole  @default(USER)
+  content         String       @db.Text
+  
+  // Socratic Metadata
+  hintEscalationLevel Int      @default(0) // 0: None, 1: Question, 2: Clue, 3: Analogy, 4: Solution
+  retrievedContextIds String[] // IDs of ContentEmbedding or KnowledgeNodes referenced
+  tokensUsed          Int      @default(0)
+  createdAt           DateTime @default(now())
+
+  @@index([sessionId])
+}
+
+// ------------------------------------------------------------------------------
+// 8. SPACED REPETITION & RETENTION FLASHCARDS (FSRS / SM-2)
+// ------------------------------------------------------------------------------
+
+model SpacedRepetitionCard {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nodeId            String
+  node              KnowledgeNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  frontPrompt       String        @db.Text
+  backExplanation   String        @db.Text
+  codeSnippet       String?       @db.Text
+  
+  // SM-2 / FSRS Parameters
+  easeFactor        Float         @default(2.5)
+  intervalDays      Int           @default(1)
+  repetitionCount   Int           @default(0)
+  lastPerformanceRating Int       @default(0) // 1 (Again), 2 (Hard), 3 (Good), 4 (Easy)
+  dueAt             DateTime      @default(now())
+  
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  @@index([userId, dueAt])
+}
+
+// ------------------------------------------------------------------------------
+// 9. SUBSCRIPTIONS & STRIPE BILLING
+// ------------------------------------------------------------------------------
+
+model Subscription {
+  id                     String           @id @default(cuid())
+  userId                 String           @unique
+  user                   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tier                   SubscriptionTier @default(FREE)
+  stripeCustomerId       String?          @unique
+  stripeSubscriptionId   String?          @unique
+  stripePriceId          String?
+  stripeCurrentPeriodEnd DateTime?
+  isActive               Boolean          @default(true)
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+
+  @@index([stripeCustomerId])
+}
